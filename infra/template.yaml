@@ -1,84 +1,297 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Transform: AWS::Serverless-2016-10-31
 Description: >
-  AirWindow - FastAPI (Mangum) on AWS Lambda behind an API Gateway HTTP API, and a
-  React frontend in a private S3 bucket served by CloudFront (Origin Access Control).
-  CloudFront routes /api/* to the HTTP API so the browser uses a single origin.
-  No VPC/NAT; the function only needs outbound HTTPS to public data APIs.
+  AirWindow - school activity air-quality planning. FastAPI (Mangum) on Lambda behind an
+  API Gateway HTTP API (Cognito JWT authorizer on coordinator routes), DynamoDB single
+  table, EventBridge Scheduler -> assessment Lambda, SNS opt-in email, private S3 for
+  frontend (CloudFront OAC) and report evidence, CloudWatch logs/metrics, AWS Budgets.
+  No VPC/NAT: functions only need outbound HTTPS to public data APIs.
 
 Parameters:
   DataMode:
     Type: String
     Default: live
     AllowedValues: [live, replay]
-    Description: live = call Open-Meteo/OpenAQ; replay = serve the labelled captured fixture.
+    Description: live = Open-Meteo/OpenAQ; replay = labelled captured/synthetic fixture (demo only).
+  ReplayFile:
+    Type: String
+    Default: fixtures/replay_delhi.json
+    Description: Fixture used when DataMode=replay (relative to the function root).
   OpenAqApiKey:
     Type: String
     Default: ""
     NoEcho: true
-    Description: Optional OpenAQ v3 API key (backend only). Leave empty to disable the station layer.
+  NvidiaApiKey:
+    Type: String
+    Default: ""
+    NoEcho: true
+    Description: Optional NVIDIA API key, fallback wording provider for coordinator bulletins.
+  NvidiaModel:
+    Type: String
+    Default: nvidia/nemotron-3-super-120b-a12b
+  BedrockModelId:
+    Type: String
+    Default: ""
+    Description: Optional Bedrock model or inference-profile id for bulletins (empty = disabled).
+  AppUrl:
+    Type: String
+    Default: ""
+    Description: Public app URL included in warning emails (set by deploy.ps1 after the first deploy).
+  AssessmentRateMinutes:
+    Type: Number
+    Default: 30
+    MinValue: 15
+    MaxValue: 1440
+  ScheduleState:
+    Type: String
+    Default: ENABLED
+    AllowedValues: [ENABLED, DISABLED]
+  WatchlistOrgIds:
+    Type: String
+    Default: ""
+    Description: Comma-separated organisation ids to assess on schedule (empty = all, capped at 10 per run).
+  BudgetEmail:
+    Type: String
+    Default: ""
+    Description: Optional email for the monthly cost budget alert (empty = no budget created).
+  MonthlyBudgetUsd:
+    Type: Number
+    Default: 5
 
 Conditions:
-  HasOpenAqKey: !Not [!Equals [!Ref OpenAqApiKey, ""]]
+  HasBudget: !Not [!Equals [!Ref BudgetEmail, ""]]
+  HasBedrock: !Not [!Equals [!Ref BedrockModelId, ""]]
+
+Globals:
+  Function:
+    Runtime: python3.13
+    Architectures: [x86_64]
+    CodeUri: .lambda-src/
+    MemorySize: 512
+    Environment:
+      Variables:
+        DATA_MODE: !Ref DataMode
+        REPLAY_FILE: !Ref ReplayFile
+        STORE: dynamodb
+        TABLE_NAME: !Ref AppTable
+        AUTH_MODE: cognito
+        COGNITO_REGION: !Ref AWS::Region
+        COGNITO_USER_POOL_ID: !Ref UserPool
+        COGNITO_CLIENT_ID: !Ref UserPoolClient
+        NOTIFIER: sns
+        TOPIC_ARN: !Ref AlertsTopic
+        EVIDENCE: s3
+        EVIDENCE_BUCKET: !Ref EvidenceBucket
+        OPENAQ_API_KEY: !Ref OpenAqApiKey
+        NVIDIA_API_KEY: !Ref NvidiaApiKey
+        NVIDIA_MODEL: !Ref NvidiaModel
+        BEDROCK_MODEL_ID: !Ref BedrockModelId
+        APP_URL: !Ref AppUrl
+        WATCHLIST_ORG_IDS: !Ref WatchlistOrgIds
+        DATA_DIR: /tmp/airwindow
 
 Resources:
+  # ------------------------------------------------------------------ data
+  AppTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: pk, AttributeType: S }
+        - { AttributeName: sk, AttributeType: S }
+        - { AttributeName: gsi1pk, AttributeType: S }
+        - { AttributeName: gsi1sk, AttributeType: S }
+        - { AttributeName: gsi2pk, AttributeType: S }
+        - { AttributeName: gsi2sk, AttributeType: S }
+      KeySchema:
+        - { AttributeName: pk, KeyType: HASH }
+        - { AttributeName: sk, KeyType: RANGE }
+      GlobalSecondaryIndexes:
+        - IndexName: gsi1
+          KeySchema: [{ AttributeName: gsi1pk, KeyType: HASH }, { AttributeName: gsi1sk, KeyType: RANGE }]
+          Projection: { ProjectionType: ALL }
+        - IndexName: gsi2
+          KeySchema: [{ AttributeName: gsi2pk, KeyType: HASH }, { AttributeName: gsi2sk, KeyType: RANGE }]
+          Projection: { ProjectionType: ALL }
+      # Housekeeping for forecast-cache items only. The app always checks expiry itself;
+      # DynamoDB TTL deletion is asynchronous and may lag.
+      TimeToLiveSpecification: { AttributeName: ttl, Enabled: true }
+      SSESpecification: { SSEEnabled: true }
+
+  # ------------------------------------------------------------------ auth
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub ${AWS::StackName}-coordinators
+      UsernameAttributes: [email]
+      AutoVerifiedAttributes: [email]
+      AccountRecoverySetting:
+        RecoveryMechanisms: [{ Name: verified_email, Priority: 1 }]
+      Policies:
+        PasswordPolicy: { MinimumLength: 10, RequireLowercase: true, RequireNumbers: true, RequireUppercase: false, RequireSymbols: false }
+      Schema:
+        - { Name: email, AttributeDataType: String, Required: true, Mutable: true }
+        - { Name: name, AttributeDataType: String, Required: true, Mutable: true }
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientName: !Sub ${AWS::StackName}-web
+      GenerateSecret: false
+      ExplicitAuthFlows: [ALLOW_USER_PASSWORD_AUTH, ALLOW_USER_SRP_AUTH, ALLOW_REFRESH_TOKEN_AUTH]
+      PreventUserExistenceErrors: ENABLED
+      IdTokenValidity: 60
+      AccessTokenValidity: 60
+      RefreshTokenValidity: 7
+      TokenValidityUnits: { IdToken: minutes, AccessToken: minutes, RefreshToken: days }
+
+  # ------------------------------------------------------------------ notifications + evidence
+  AlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: AirWindow
+      KmsMasterKeyId: alias/aws/sns
+
+  EvidenceBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration: { BlockPublicAcls: true, BlockPublicPolicy: true, IgnorePublicAcls: true, RestrictPublicBuckets: true }
+      OwnershipControls: { Rules: [{ ObjectOwnership: BucketOwnerEnforced }] }
+      BucketEncryption: { ServerSideEncryptionConfiguration: [{ ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 } }] }
+      LifecycleConfiguration:
+        Rules: [{ Id: expire-evidence, Status: Enabled, ExpirationInDays: 180 }]
+      CorsConfiguration:
+        CorsRules:
+          # Browser presigned POST uploads from the CloudFront-hosted app. Uploads are
+          # additionally restricted by the signed policy (key, content type, size, 5 min).
+          - { AllowedMethods: [POST], AllowedOrigins: ["https://*.cloudfront.net"], AllowedHeaders: ["*"], MaxAge: 600 }
+
+  EvidenceBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref EvidenceBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource: [!GetAtt EvidenceBucket.Arn, !Sub "${EvidenceBucket.Arn}/*"]
+            Condition: { Bool: { aws:SecureTransport: "false" } }
+
+  # ------------------------------------------------------------------ compute
   ApiLogGroup:
     Type: AWS::Logs::LogGroup
-    Properties:
-      LogGroupName: !Sub /aws/lambda/${AWS::StackName}-api
-      RetentionInDays: 14
+    Properties: { LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-api", RetentionInDays: 14 }
+
+  AssessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: { LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-assess", RetentionInDays: 14 }
 
   ApiFunction:
     Type: AWS::Serverless::Function
     Properties:
       FunctionName: !Sub ${AWS::StackName}-api
       Description: AirWindow API (FastAPI + Mangum)
-      CodeUri: ../backend/
       Handler: app.main.handler
-      Runtime: python3.13
-      Architectures: [x86_64]
-      MemorySize: 512
-      Timeout: 25
-      LoggingConfig:
-        LogGroup: !Ref ApiLogGroup
-      Environment:
-        Variables:
-          DATA_MODE: !Ref DataMode
-          OPENAQ_API_KEY: !If [HasOpenAqKey, !Ref OpenAqApiKey, ""]
-      # Default SAM role = AWSLambdaBasicExecutionRole only (CloudWatch Logs).
-      # The function reads no other AWS resources.
+      Timeout: 29
+      LoggingConfig: { LogGroup: !Ref ApiLogGroup }
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref AppTable }
+        - Statement:
+            - Effect: Allow
+              Action: [sns:Publish, sns:Subscribe]
+              Resource: !Ref AlertsTopic
+            - Effect: Allow
+              Action: [sns:Unsubscribe, sns:GetSubscriptionAttributes]
+              Resource: !Sub "${AlertsTopic}:*"
+            - Effect: Allow
+              Action: [s3:PutObject, s3:GetObject, s3:DeleteObject]
+              Resource: !Sub "${EvidenceBucket.Arn}/reports/*"
+            - !If
+              - HasBedrock
+              - Effect: Allow
+                Action: [bedrock:InvokeModel]
+                Resource:
+                  - "arn:aws:bedrock:*::foundation-model/*"
+                  - !Sub "arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/*"
+              - !Ref AWS::NoValue
       Events:
-        ApiRoutes:
+        Public:
           Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: "/api/{proxy+}", Method: ANY }  # public: map, forecast, plan, impact
+        OrgsRoot:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /api/orgs, Method: ANY, Auth: { Authorizer: CognitoJwt } }
+        Orgs:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: "/api/orgs/{proxy+}", Method: ANY, Auth: { Authorizer: CognitoJwt } }
+        Me:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /api/me, Method: GET, Auth: { Authorizer: CognitoJwt } }
+
+  AssessmentFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-assess
+      Description: Scheduled assessment of upcoming school activities (same path as the in-app check)
+      Handler: app.jobs.handler
+      Timeout: 120
+      LoggingConfig: { LogGroup: !Ref AssessLogGroup }
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref AppTable }
+        - Statement:
+            - Effect: Allow
+              Action: [sns:Publish]
+              Resource: !Ref AlertsTopic
+            - Effect: Allow
+              Action: [sns:GetSubscriptionAttributes]
+              Resource: !Sub "${AlertsTopic}:*"
+      Events:
+        Schedule:
+          Type: ScheduleV2
           Properties:
-            ApiId: !Ref HttpApi
-            Path: /api/{proxy+}
-            Method: ANY
+            ScheduleExpression: !Sub "rate(${AssessmentRateMinutes} minutes)"
+            State: !Ref ScheduleState
+            Input: '{"source":"eventbridge-scheduler"}'
+            RetryPolicy: { MaximumRetryAttempts: 1, MaximumEventAgeInSeconds: 900 }
 
   HttpApi:
     Type: AWS::Serverless::HttpApi
     Properties:
       Description: AirWindow HTTP API
-      DefaultRouteSettings:
-        # Protects the free upstream data APIs from bursts.
-        ThrottlingBurstLimit: 40
-        ThrottlingRateLimit: 20
+      DefaultRouteSettings: { ThrottlingBurstLimit: 40, ThrottlingRateLimit: 20 }
+      Auth:
+        Authorizers:
+          CognitoJwt:
+            IdentitySource: $request.header.Authorization
+            JwtConfiguration:
+              issuer: !Sub "https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}"
+              audience: [!Ref UserPoolClient]
 
+  AssessErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Scheduled assessment Lambda reported errors
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions: [{ Name: FunctionName, Value: !Ref AssessmentFunction }]
+      Statistic: Sum
+      Period: 3600
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+  # ------------------------------------------------------------------ frontend hosting
   SiteBucket:
     Type: AWS::S3::Bucket
     Properties:
-      PublicAccessBlockConfiguration:
-        BlockPublicAcls: true
-        BlockPublicPolicy: true
-        IgnorePublicAcls: true
-        RestrictPublicBuckets: true
-      OwnershipControls:
-        Rules:
-          - ObjectOwnership: BucketOwnerEnforced
-      BucketEncryption:
-        ServerSideEncryptionConfiguration:
-          - ServerSideEncryptionByDefault:
-              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration: { BlockPublicAcls: true, BlockPublicPolicy: true, IgnorePublicAcls: true, RestrictPublicBuckets: true }
+      OwnershipControls: { Rules: [{ ObjectOwnership: BucketOwnerEnforced }] }
+      BucketEncryption: { ServerSideEncryptionConfiguration: [{ ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 } }] }
 
   SiteBucketPolicy:
     Type: AWS::S3::BucketPolicy
@@ -89,23 +302,16 @@ Resources:
         Statement:
           - Sid: AllowCloudFrontOACRead
             Effect: Allow
-            Principal:
-              Service: cloudfront.amazonaws.com
+            Principal: { Service: cloudfront.amazonaws.com }
             Action: s3:GetObject
-            Resource: !Sub ${SiteBucket.Arn}/*
-            Condition:
-              StringEquals:
-                AWS:SourceArn: !Sub arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${Distribution}
+            Resource: !Sub "${SiteBucket.Arn}/*"
+            Condition: { StringEquals: { AWS:SourceArn: !Sub "arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${Distribution}" } }
           - Sid: DenyInsecureTransport
             Effect: Deny
             Principal: "*"
             Action: s3:*
-            Resource:
-              - !GetAtt SiteBucket.Arn
-              - !Sub ${SiteBucket.Arn}/*
-            Condition:
-              Bool:
-                aws:SecureTransport: "false"
+            Resource: [!GetAtt SiteBucket.Arn, !Sub "${SiteBucket.Arn}/*"]
+            Condition: { Bool: { aws:SecureTransport: "false" } }
 
   SiteOAC:
     Type: AWS::CloudFront::OriginAccessControl
@@ -130,13 +336,10 @@ Resources:
           - Id: site
             DomainName: !GetAtt SiteBucket.RegionalDomainName
             OriginAccessControlId: !GetAtt SiteOAC.Id
-            S3OriginConfig:
-              OriginAccessIdentity: ""
+            S3OriginConfig: { OriginAccessIdentity: "" }
           - Id: api
-            DomainName: !Sub ${HttpApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}
-            CustomOriginConfig:
-              OriginProtocolPolicy: https-only
-              OriginSSLProtocols: [TLSv1.2]
+            DomainName: !Sub "${HttpApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}"
+            CustomOriginConfig: { OriginProtocolPolicy: https-only, OriginSSLProtocols: [TLSv1.2] }
         DefaultCacheBehavior:
           TargetOriginId: site
           ViewerProtocolPolicy: redirect-to-https
@@ -151,21 +354,34 @@ Resources:
             Compress: true
             AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
             CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad # Managed-CachingDisabled
+            # Forwards all viewer headers except Host, including Authorization for the JWT authorizer.
             OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac # Managed-AllViewerExceptHostHeader
 
+  # ------------------------------------------------------------------ cost control
+  CostBudget:
+    Type: AWS::Budgets::Budget
+    Condition: HasBudget
+    Properties:
+      Budget:
+        BudgetName: !Sub ${AWS::StackName}-monthly
+        BudgetType: COST
+        TimeUnit: MONTHLY
+        BudgetLimit: { Amount: !Ref MonthlyBudgetUsd, Unit: USD }
+      NotificationsWithSubscribers:
+        - Notification: { NotificationType: ACTUAL, ComparisonOperator: GREATER_THAN, Threshold: 80, ThresholdType: PERCENTAGE }
+          Subscribers: [{ SubscriptionType: EMAIL, Address: !Ref BudgetEmail }]
+        - Notification: { NotificationType: FORECASTED, ComparisonOperator: GREATER_THAN, Threshold: 100, ThresholdType: PERCENTAGE }
+          Subscribers: [{ SubscriptionType: EMAIL, Address: !Ref BudgetEmail }]
+
 Outputs:
-  SiteUrl:
-    Description: Public URL of the app (CloudFront)
-    Value: !Sub https://${Distribution.DomainName}
-  ApiEndpoint:
-    Description: Direct HTTP API endpoint (the app uses /api via CloudFront)
-    Value: !Sub https://${HttpApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}
-  SiteBucketName:
-    Description: Private S3 bucket holding the built frontend
-    Value: !Ref SiteBucket
-  DistributionId:
-    Description: CloudFront distribution id (for invalidations)
-    Value: !Ref Distribution
-  FunctionName:
-    Description: Lambda function name
-    Value: !Ref ApiFunction
+  SiteUrl: { Description: Public URL of the app (CloudFront), Value: !Sub "https://${Distribution.DomainName}" }
+  ApiEndpoint: { Value: !Sub "https://${HttpApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}" }
+  SiteBucketName: { Value: !Ref SiteBucket }
+  DistributionId: { Value: !Ref Distribution }
+  FunctionName: { Value: !Ref ApiFunction }
+  AssessmentFunctionName: { Value: !Ref AssessmentFunction }
+  TableName: { Value: !Ref AppTable }
+  TopicArn: { Value: !Ref AlertsTopic }
+  EvidenceBucketName: { Value: !Ref EvidenceBucket }
+  UserPoolId: { Value: !Ref UserPool }
+  UserPoolClientId: { Value: !Ref UserPoolClient }
