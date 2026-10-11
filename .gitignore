@@ -24,3 +24,6 @@ samconfig.local.toml
 Thumbs.db
 .vscode/
 .idea/
+
+# Local tooling
+.tools-venv/
