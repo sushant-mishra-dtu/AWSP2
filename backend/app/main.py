@@ -124,9 +124,20 @@ if settings.static_dir and settings.static_dir.is_dir():
     app.mount("/", StaticFiles(directory=settings.static_dir, html=True), name="static")
 
 
-try:
-    from mangum import Mangum
+from mangum import Mangum  # noqa: E402
 
-    handler = Mangum(app, lifespan="off")
-except ImportError:  # pragma: no cover - mangum is in requirements
-    handler = None
+_mangum = Mangum(app, lifespan="off")
+
+
+def handler(event, context):
+    """Lambda entry point. Mangum runs each request on the thread's current
+    event loop; make sure one exists and is open (warm containers reuse it)."""
+    import asyncio
+
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_closed():
+            raise RuntimeError("closed")
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
+    return _mangum(event, context)

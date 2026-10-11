@@ -1,0 +1,171 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  AirWindow - FastAPI (Mangum) on AWS Lambda behind an API Gateway HTTP API, and a
+  React frontend in a private S3 bucket served by CloudFront (Origin Access Control).
+  CloudFront routes /api/* to the HTTP API so the browser uses a single origin.
+  No VPC/NAT; the function only needs outbound HTTPS to public data APIs.
+
+Parameters:
+  DataMode:
+    Type: String
+    Default: live
+    AllowedValues: [live, replay]
+    Description: live = call Open-Meteo/OpenAQ; replay = serve the labelled captured fixture.
+  OpenAqApiKey:
+    Type: String
+    Default: ""
+    NoEcho: true
+    Description: Optional OpenAQ v3 API key (backend only). Leave empty to disable the station layer.
+
+Conditions:
+  HasOpenAqKey: !Not [!Equals [!Ref OpenAqApiKey, ""]]
+
+Resources:
+  ApiLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AWS::StackName}-api
+      RetentionInDays: 14
+
+  ApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-api
+      Description: AirWindow API (FastAPI + Mangum)
+      CodeUri: ../backend/
+      Handler: app.main.handler
+      Runtime: python3.13
+      Architectures: [x86_64]
+      MemorySize: 512
+      Timeout: 25
+      LoggingConfig:
+        LogGroup: !Ref ApiLogGroup
+      Environment:
+        Variables:
+          DATA_MODE: !Ref DataMode
+          OPENAQ_API_KEY: !If [HasOpenAqKey, !Ref OpenAqApiKey, ""]
+      # Default SAM role = AWSLambdaBasicExecutionRole only (CloudWatch Logs).
+      # The function reads no other AWS resources.
+      Events:
+        ApiRoutes:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /api/{proxy+}
+            Method: ANY
+
+  HttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      Description: AirWindow HTTP API
+      DefaultRouteSettings:
+        # Protects the free upstream data APIs from bursts.
+        ThrottlingBurstLimit: 40
+        ThrottlingRateLimit: 20
+
+  SiteBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  SiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SiteBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowCloudFrontOACRead
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub ${SiteBucket.Arn}/*
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${Distribution}
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource:
+              - !GetAtt SiteBucket.Arn
+              - !Sub ${SiteBucket.Arn}/*
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+  SiteOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub ${AWS::StackName}-site-oac
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Comment: !Sub AirWindow (${AWS::StackName})
+        Enabled: true
+        HttpVersion: http2and3
+        IPV6Enabled: true
+        PriceClass: PriceClass_200
+        DefaultRootObject: index.html
+        Origins:
+          - Id: site
+            DomainName: !GetAtt SiteBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt SiteOAC.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+          - Id: api
+            DomainName: !Sub ${HttpApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}
+            CustomOriginConfig:
+              OriginProtocolPolicy: https-only
+              OriginSSLProtocols: [TLSv1.2]
+        DefaultCacheBehavior:
+          TargetOriginId: site
+          ViewerProtocolPolicy: redirect-to-https
+          Compress: true
+          AllowedMethods: [GET, HEAD]
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6 # Managed-CachingOptimized
+          ResponseHeadersPolicyId: 67f7725c-6f97-4210-82d7-5512b31e9d03 # Managed-SecurityHeadersPolicy
+        CacheBehaviors:
+          - PathPattern: /api/*
+            TargetOriginId: api
+            ViewerProtocolPolicy: https-only
+            Compress: true
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad # Managed-CachingDisabled
+            OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac # Managed-AllViewerExceptHostHeader
+
+Outputs:
+  SiteUrl:
+    Description: Public URL of the app (CloudFront)
+    Value: !Sub https://${Distribution.DomainName}
+  ApiEndpoint:
+    Description: Direct HTTP API endpoint (the app uses /api via CloudFront)
+    Value: !Sub https://${HttpApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}
+  SiteBucketName:
+    Description: Private S3 bucket holding the built frontend
+    Value: !Ref SiteBucket
+  DistributionId:
+    Description: CloudFront distribution id (for invalidations)
+    Value: !Ref Distribution
+  FunctionName:
+    Description: Lambda function name
+    Value: !Ref ApiFunction
