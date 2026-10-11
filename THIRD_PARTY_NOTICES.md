@@ -45,7 +45,12 @@ Fonts: Inter and JetBrains Mono, loaded from Google Fonts (SIL Open Font License
 | typing_extensions | 4.16.0 | PSF-2.0 |
 | opentelemetry-api (transitive) | 1.45.1 | Apache-2.0 |
 
-Dev/deploy tools (not shipped): uvicorn (BSD-3-Clause), pytest (MIT), AWS SAM CLI (Apache-2.0).
+AWS SDK: boto3 / botocore / s3transfer 1.43.x (Apache-2.0), with jmespath (MIT), python-dateutil
+(Apache-2.0/BSD dual) and urllib3 (MIT). On Lambda the runtime-provided boto3 is used; the pinned
+version is used locally and in tests.
+
+Dev/deploy/test tools (not shipped): uvicorn (BSD-3-Clause), pytest (MIT), AWS SAM CLI (Apache-2.0),
+**moto 5.2.3 (Apache-2.0), a local AWS API emulator used only in tests** (it is not AWS; see README §4).
 
 ## Data and map services
 
@@ -56,6 +61,11 @@ Dev/deploy tools (not shipped): uvicorn (BSD-3-Clause), pytest (MIT), AWS SAM CL
 | [Open-Meteo Geocoding API](https://open-meteo.com/en/docs/geocoding-api) | Place search | CC BY 4.0; based on GeoNames (CC BY 4.0) |
 | [OpenAQ API v3](https://docs.openaq.org/) (optional) | Nearby station observations | OpenAQ platform terms; each location's data licence/attribution is returned by the API and shown per station |
 | [OpenStreetMap](https://www.openstreetmap.org/copyright) standard tiles | Base map | Map data © OpenStreetMap contributors (ODbL); tiles used under the OSMF Tile Usage Policy with attribution |
+| [AirNow / U.S. EPA school guidance](https://www.airnow.gov/publications/air-quality-flag-program-getting-started/air-quality-and-outdoor-activity-guidance-for-schools-flag-program/) | Per-category outdoor-activity guidance shown on action cards and in bulletins | U.S. government work (EPA-456/F-14-003, Aug 2014). Paraphrased with source link; labelled US-AQI guidance, not an Indian directive |
+| [NVIDIA API catalog](https://build.nvidia.com/) (optional) | Fallback wording/translation of coordinator bulletins (`nvidia/nemotron-3-super-120b-a12b`) | NVIDIA API terms of service. Only the bulletin fact summary is sent; output is validated and shown separately as AI-worded |
+| Amazon Bedrock (optional) | Primary wording/translation of bulletins when a model id is configured | AWS Service Terms and the chosen model's terms |
+
+Hindi bulletin templates in `backend/app/bulletin.py` were translated with AI assistance (see README §9).
 
 Attribution for Open-Meteo/CAMS and OpenStreetMap is shown in the map's attribution control,
 the app footer and the "Evidence & limitations" panel.

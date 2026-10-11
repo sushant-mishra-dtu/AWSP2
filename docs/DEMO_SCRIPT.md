@@ -1,53 +1,60 @@
-# AirWindow — demo script (target 2:45, hard limit 3:00)
+# AirWindow — demo script (target 2:50, hard limit 3:00)
 
-**Setup before recording**
-- Open the deployed CloudFront URL (from `scripts/deploy.ps1` output) at desktop width (≥ 1280 px).
-- In a second tab, open the AWS console on the `airwindow` CloudFormation stack (Resources tab), plus
-  CloudWatch Logs for `/aws/lambda/airwindow-api`.
-- Live numbers change hourly. For a reproducible recording, deploy with `-DataMode replay`. The header
-  then shows **REPLAY · captured 2026-10-11 10:51 UTC**; say so on camera. The numbers below are from that capture.
-- Clear the site's local storage, or set the planner to: Tomorrow · 60 min · 07:00–17:00 · planned 07:30 · threshold ≤ 100.
+**Flow:** campus registration → upcoming activity → forecast warning → alternative time → coordinator action →
+notification → stored action history → impact.
+
+## Before recording
+
+- **Data:** use the labelled SYNTHETIC scenario for a reproducible "warning + alternative" story:
+  `.\.venv\Scripts\python.exe backend\scripts\serve.py --demo synthetic` (or deploy with `-DataMode replay -Replay synthetic`).
+  The header reads **REPLAY · captured 2026-10-11 11:00:00 UTC · SYNTHETIC**. Say so on camera.
+- For the genuine-data moment, keep a second tab on the live app (`serve.py` with no `--demo`). In live data on 11 Oct, Delhi
+  tomorrow 07:30 showed **US AQI 158 with no permitted time under 150**, which is the "no eligible alternative" case.
+- **If deployed:** subscribe your own email in Setup and **click the AWS confirmation link before recording**. Open the
+  CloudWatch log group `/aws/lambda/airwindow-assess` and the DynamoDB table in the console.
+- **If AWS is still blocked:** do **not** imply deployment. Use the AWS segment's fallback below.
 
 ---
 
-**0:00–0:20 · The problem**
-> "I coordinate outdoor activities at a Delhi school. In October the air is bad almost all day, but not
-> equally bad. A single 'AQI now' number doesn't tell me *when* tomorrow to hold a 60-minute PE period,
-> or whether I should move it indoors. AirWindow answers that from forecast data, and shows how far to trust it."
+**0:00–0:20 · Problem**
+> "I coordinate outdoor PE at a Delhi school. In October the air is bad most days, but not equally bad at every hour.
+> I need to know *which* sessions are at risk tomorrow, what lower-pollution time I'm allowed to use, and a record of what we did."
 
-**0:20–0:50 · Live map**
-- Point at the header badge (LIVE DATA or REPLAY with its capture time).
-- "Each square is a Copernicus CAMS Global model cell, about 45 km wide. The colours are US AQI as
-  calculated by Open-Meteo, a modelled forecast rather than a local measurement." Point at the legend.
-- Point at a dark cell: "Above 500 we say **Beyond AQI**, without capping it. The panel shows it's driven by the PM10 24-hour average."
-- Zoom in to street level and show the notice: "The model can't tell one street or school from another, and the app says so at every zoom."
+**0:20–0:45 · Campus registration + timetable** (My campus tab)
+- Sign in. Locally the panel says *"Local development sign-in — not Cognito"*; on AWS it is Cognito.
+- Register "Demo Public School" at Connaught Place. The timezone is detected as **Asia/Kolkata** and the threshold is **≤ 150**.
+  Point out that it's flagged as a **demo record** automatically because the data is synthetic.
+- Setup: Morning PE, daily 07:30, 60 min, **~40 participants (estimate only, no names)**, alternative window 13:30–16:00.
 
-**0:50–1:20 · Selected location and forecast**
-- Click **Connaught Place**: "Modelled US AQI 160, Unhealthy. The highest sub-index is PM2.5 on a
-  24-hour rolling average. Pollutants are shown with units, and weather appears as context only."
-- Point at **Data quality**: "0.4° resolution, 3-hourly native time step, the model grid point is 3.9 km
-  from my point, and the retrieval time is shown."
-- Drag the **time slider**: "One slider moves the map cells, this panel and the 48-hour chart together."
+**0:45–1:20 · Forecast warning**
+- Click **Check upcoming activities now**: *"Same path as the scheduled job: 3 assessed · 2 new warnings"*.
+- Click it again: **0 new warnings**. "Repeated runs don't spam people."
+- Open Monday's action card: **US AQI 178 (Unhealthy) exceeds 150**, index 96.0 µg·h/m³, alternative **13:30–14:30, AQI 128,
+  −54.2% PM2.5 index**. Point at the named standard, the evidence (source, valid and retrieved times, ~45 km, SYNTHETIC), the AirNow
+  **US-AQI** guidance ("not an Indian directive"), and *"Indoor air quality is unverified."*
 
-**1:20–2:10 · Activity comparison**
-- Planner is at threshold **≤ 100**: "No window tomorrow meets AQI 100. The app says so in amber.
-  The least-polluted slot, 15:30–16:30, is **not labelled safe**; it suggests an indoor alternative."
-- Switch the threshold to **≤ 200**: "Now 15:30–16:30 is the lowest-index eligible window, with a
-  **29% lower PM2.5 pollution-time index** than my planned 07:30 slot: 53.9 vs 75.9 µg·h/m³.
-  It's still Unhealthy, and the app says that too."
-- Point at the chart: grey is my slot, green is the alternative, the shaded band is the permitted hours.
-- Open **Why this result?**: "It sums hourly PM2.5 times minutes of overlap, so partial hours count
-  correctly. Windows with missing data are excluded. The explanation is generated from the numbers,
-  with no AI involved, and it isn't a dose or health-risk score. Rescheduling doesn't clean the air."
+**1:20–1:50 · Coordinator action + bulletin**
+- Click **Accept time** for 13:30–14:30. The card records the decision with **−54.2% (same location, duration, source and forecast
+  retrieval)** and *"a recorded decision is not proof the change happened."*
+- Click **हिन्दी**. The deterministic Hindi bulletin appears first, then the separately labelled *AI-worded version (NVIDIA API fallback)*.
+  "If the model changes any number or time, we throw it away. That happened in testing: it appended a word count."
+- For today's session, which has already started, click **Held as planned**. Outcome is recorded separately from acceptance.
 
-**2:10–2:40 · Real AWS use**
-- Switch to the CloudFormation stack: "This is deployed with AWS SAM: a Lambda function running
-  FastAPI, an API Gateway HTTP API with throttling, a **private** S3 bucket served only through
-  CloudFront Origin Access Control, and CloudFront routing `/api/*` to the API."
-- Show CloudWatch Logs: the `/api/plan` and `/api/grid` requests made a moment ago.
-- "Keys stay server-side, and there's no NAT, VPC or database. Teardown is one script."
+**1:50–2:25 · Notification + AWS evidence**
+- *If deployed:* in Setup, the subscription shows **Confirmed**. Click **Send test notification**: *"Publish accepted
+  (MessageId …)"*. Show the email arriving. Say: "publish accepted is not proof anyone read it, so the warning has an Acknowledge
+  button." Then show `.\scripts\verify-aws.ps1`: two Lambda invocations (**second: alerts_created 0**), DynamoDB counts by type,
+  the Scheduler schedule, and CloudWatch log lines.
+- *If AWS is still blocked (current state):* say plainly *"This build is not deployed. The AWS account isn't activated."* Show the
+  warning's status chip **"Prepared, not sent (local mode)"**, then `infra/template.yaml` (Cognito authorizer, DynamoDB, Scheduler,
+  SNS), `sam build` succeeding, and the moto test run (`pytest tests/test_aws_adapters.py`). Call it **emulated**, not AWS.
 
-**2:40–2:55 · Close**
-- Open **Evidence & limitations**: "Every number shows its source, model, resolution, retrieval time
-  and stale status. If a provider fails, you get an error rather than made-up data."
-- "AirWindow helps coordinators pick the least-bad time and be honest about the forecast's limits."
+**2:25–2:45 · History + community + impact**
+- **History** tab: registration → activity → assessment → alert → decision → outcome, each with actor and time.
+- **Reports**: one submitted "open burning at the east gate" report moving through Reviewed → Assigned → Action recorded →
+  Resolution reviewed, still marked *"not independent verification … does not show emissions were reduced."*
+- **Impact** tab: *Genuine usage* shows 0. Switch to *Demo records* to see the counts. "Participant-sessions are estimates, not
+  unique people. The index change is modelled, not a health outcome."
+
+**2:45–2:55 · Close**
+> "AirWindow turns a forecast into a decision, a warning and an accountable record, and it's honest about what the data can't tell you."
