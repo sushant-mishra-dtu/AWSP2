@@ -7,10 +7,9 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-import app.main as main
 from app.config import Settings
-from app.replay import ReplayStore
-from app.service import Service
+from app.main import create_app
+from app.runtime import build
 
 from .conftest import FakeClock, synthetic_hourly
 
@@ -37,11 +36,14 @@ def clock():
     return FakeClock()
 
 
+def make_client(tmp_path, clock=None, **settings):
+    rt = build(Settings(data_dir=tmp_path, **settings), clock=clock)
+    return TestClient(create_app(rt))
+
+
 @pytest.fixture
-def client(monkeypatch, clock):
-    svc = Service(Settings(), None, clock=clock)
-    monkeypatch.setattr(main, "service", svc)
-    return TestClient(main.app)
+def client(tmp_path, clock):
+    return make_client(tmp_path, clock)
 
 
 def test_point_provider_error_returns_error_not_data(client, router):
@@ -143,9 +145,8 @@ def test_stations_without_key_explains_unavailable(client, router):
     assert router.calls == []
 
 
-def test_stations_with_key_reports_raw_observations(monkeypatch, router, clock):
-    svc = Service(Settings(openaq_api_key="test-key"), None, clock=clock)
-    monkeypatch.setattr(main, "service", svc)
+def test_stations_with_key_reports_raw_observations(tmp_path, router, clock):
+    c = make_client(tmp_path, clock, openaq_api_key="test-key")
     loc = {
         "id": 42, "name": "Test Station", "locality": "Delhi", "timezone": "Asia/Kolkata",
         "provider": {"id": 1, "name": "CPCB"}, "owner": {"id": 2, "name": "Owner"},
@@ -159,7 +160,7 @@ def test_stations_with_key_reports_raw_observations(monkeypatch, router, clock):
         {"datetime": {"utc": "2026-10-11T11:00:00Z", "local": "2026-10-11T16:30:00+05:30"}, "value": 88.0,
          "coordinates": {"latitude": 28.63, "longitude": 77.22}, "sensorsId": 7, "locationsId": 42}]}))
     router.add("api.openaq.org/v3/locations", httpx.Response(200, json={"results": [loc, stale_loc]}))
-    j = TestClient(main.app).get("/api/stations", params={"lat": 28.6, "lon": 77.2}).json()
+    j = c.get("/api/stations", params={"lat": 28.6, "lon": 77.2}).json()
     assert j["status"] == "ok"
     assert j["counts"]["inactive_omitted"] == 1
     s = j["stations"][0]
@@ -193,7 +194,7 @@ def test_plan_end_to_end_with_synthetic_series(client, router):
     assert j["baseline"]["pm25_index"] == pytest.approx(25.0)
 
 
-def test_replay_mode_is_labelled(tmp_path, monkeypatch):
+def test_replay_mode_is_labelled(tmp_path):
     fixture = {
         "meta": {"captured_at": "2026-10-11T10:00:00Z", "synthetic": True,
                  "description": "SYNTHETIC test fixture", "sources": ["synthetic"]},
@@ -203,9 +204,7 @@ def test_replay_mode_is_labelled(tmp_path, monkeypatch):
     }
     path = tmp_path / "replay.json"
     path.write_text(json.dumps(fixture), encoding="utf-8")
-    svc = Service(Settings(data_mode="replay"), ReplayStore.load(path))
-    monkeypatch.setattr(main, "service", svc)
-    c = TestClient(main.app)
+    c = make_client(tmp_path, data_mode="replay", replay_file=path)
     j = c.get("/api/point", params={"lat": 28.62, "lon": 77.21}).json()
     assert j["mode"] == "replay"
     assert j["replay"]["synthetic"] is True

@@ -51,9 +51,9 @@ class TTLCache:
     def get_stale(self, key: Hashable) -> Entry | None:
         return self._get(key, self.max_stale_s)
 
-    def set(self, key: Hashable, value: Any) -> Entry:
+    def set(self, key: Hashable, value: Any, stored_at: float | None = None) -> Entry:
         with self._lock:
-            e = Entry(value=value, stored_at=self._clock())
+            e = Entry(value=value, stored_at=self._clock() if stored_at is None else stored_at)
             self._data[key] = e
             self._data.move_to_end(key)
             while len(self._data) > self.maxsize:

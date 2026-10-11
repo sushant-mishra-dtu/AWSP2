@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 import time
 from datetime import date, datetime, timedelta, timezone
@@ -57,10 +58,15 @@ def valid_tz(name: str | None) -> str | None:
 
 
 class Service:
-    def __init__(self, settings: Settings, replay: ReplayStore | None = None, clock: Callable[[], float] = time.time):
+    def __init__(self, settings: Settings, replay: ReplayStore | None = None, clock: Callable[[], float] = time.time,
+                 table=None):
         self.settings = settings
         self.replay = replay
         self.clock = clock
+        # Optional shared forecast cache (DynamoDB on AWS) so scheduled runs and
+        # API containers reuse fresh data. Expiry is always checked explicitly;
+        # DynamoDB TTL deletion is only housekeeping and may lag.
+        self.table = table
         self.point_cache = TTLCache(maxsize=256, ttl_s=30 * 60, max_stale_s=6 * 3600, clock=clock)
         self.wx_cache = TTLCache(maxsize=256, ttl_s=30 * 60, max_stale_s=6 * 3600, clock=clock)
         self.tz_cache = TTLCache(maxsize=1024, ttl_s=7 * 86400, max_stale_s=30 * 86400, clock=clock)
@@ -111,7 +117,7 @@ class Service:
             return p["aq"], meta, p.get("weather"), meta, p.get("timezone") or "UTC", None, p
 
         key = (round(lat, 3), round(lon, 3))
-        aq_raw, aq_meta = await cached_fetch(self.point_cache, key, lambda: om.fetch_point_aq(lat, lon))
+        aq_raw, aq_meta = await self._aq_cached(lat, lon, key)
         try:
             wx_raw, wx_meta = await cached_fetch(self.wx_cache, key, lambda: om.fetch_point_weather(lat, lon))
         except ProviderError as err:
@@ -125,6 +131,71 @@ class Service:
             except ProviderError:
                 tz, tz_note = "UTC", "Timezone lookup failed; times are shown in UTC."
         return aq_raw, aq_meta, wx_raw, wx_meta, tz, tz_note, None
+
+    async def _aq_cached(self, lat: float, lon: float, key: tuple[float, float]):
+        if self.table is None:
+            return await cached_fetch(self.point_cache, key, lambda: om.fetch_point_aq(lat, lon))
+        e = self.point_cache.get_fresh(key)
+        if e is not None:
+            return e.value, cache_meta(e, "hit")
+        pk, sk = "CACHE#AQ", f"{key[0]:.3f},{key[1]:.3f}"
+        now = self.clock()
+        try:
+            l2 = self.table.get(pk, sk)
+        except Exception:  # noqa: BLE001 - the shared cache is an optimisation only
+            l2 = None
+        if l2 and now < float(l2["expires_at"]):
+            entry = self.point_cache.set(key, json.loads(l2["payload"]), stored_at=float(l2["retrieved_epoch"]))
+            return entry.value, {**cache_meta(entry, "hit"), "layer": "shared"}
+        try:
+            raw = await om.fetch_point_aq(lat, lon)
+        except ProviderError as err:
+            stale = self.point_cache.get_stale(key)
+            if stale is not None:
+                return stale.value, cache_meta(stale, "stale", str(err))
+            if l2 and now < float(l2["stale_until"]):
+                entry = self.point_cache.set(key, json.loads(l2["payload"]), stored_at=float(l2["retrieved_epoch"]))
+                return entry.value, {**cache_meta(entry, "stale", str(err)), "layer": "shared"}
+            raise
+        entry = self.point_cache.set(key, raw)
+        try:
+            self.table.put({
+                "pk": pk, "sk": sk, "type": "forecast_cache", "payload": json.dumps(raw, separators=(",", ":")),
+                "retrieved_epoch": entry.stored_at, "expires_at": entry.stored_at + self.point_cache.ttl_s,
+                "stale_until": entry.stored_at + self.point_cache.max_stale_s,
+                "ttl": int(entry.stored_at + self.point_cache.max_stale_s + 3600),
+            })
+        except Exception:  # noqa: BLE001
+            pass
+        return raw, cache_meta(entry, "miss")
+
+    def mode_info(self) -> dict[str, Any]:
+        return {
+            "mode": self.mode,
+            "replay_captured_at": self.replay.meta.get("captured_at") if self.replay else None,
+            "replay_synthetic": bool(self.replay and self.replay.synthetic),
+        }
+
+    async def campus_series(self, lat: float, lon: float, tz: str):
+        """Air-quality series only (weather is display context and not needed to assess)."""
+        if self.replay:
+            p = self.replay.point(lat, lon)
+            aq_raw = p["aq"]
+            aq_meta = {"status": "replay", "stale": False, "retrieved_at": self.replay.meta.get("captured_at"), "error": None}
+        else:
+            aq_raw, aq_meta = await self._aq_cached(lat, lon, (round(lat, 3), round(lon, 3)))
+        aq = om.parse_hourly(aq_raw, ["pm2_5", "us_aqi"])
+        series = {
+            datetime.fromtimestamp(t, timezone.utc): planner.SeriesPoint(pm, us)
+            for t, pm, us in zip(aq["times"], aq["series"]["pm2_5"]["values"], aq["series"]["us_aqi"]["values"])
+        }
+        return series, aq_meta, self.mode_info()
+
+    async def timezone_for(self, lat: float, lon: float) -> str:
+        if self.replay:
+            return self.replay.point(lat, lon).get("timezone") or "UTC"
+        tz, _ = await cached_fetch(self.tz_cache, (round(lat, 2), round(lon, 2)), lambda: om.fetch_timezone(lat, lon))
+        return valid_tz(tz) or "UTC"
 
     async def point(self, lat: float, lon: float, tz_hint: str | None = None) -> dict[str, Any]:
         aq_raw, aq_meta, wx_raw, wx_meta, tz, tz_note, replay_pt = await self._point_raw(lat, lon, tz_hint)

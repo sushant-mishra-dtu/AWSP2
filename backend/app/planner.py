@@ -49,6 +49,12 @@ class PlanInput:
     threshold_aqi: int
     step_min: int = 15
     interval_s: int = 3600
+    # Optional several permitted ranges (minutes after local midnight). When
+    # given they replace allowed_start_min/allowed_end_min for candidates.
+    allowed_ranges: tuple[tuple[int, int], ...] | None = None
+
+    def ranges(self) -> tuple[tuple[int, int], ...]:
+        return self.allowed_ranges or ((self.allowed_start_min, self.allowed_end_min),)
 
 
 @dataclass
@@ -177,11 +183,14 @@ def validate(p: PlanInput) -> ZoneInfo:
         tz = ZoneInfo(p.timezone)
     except Exception as exc:  # noqa: BLE001 - zoneinfo raises several types
         raise PlanInputError(f"unknown timezone: {p.timezone}") from exc
-    if not 0 <= p.allowed_start_min < p.allowed_end_min <= 1440:
-        raise PlanInputError("allowed hours must satisfy 0 <= start < end <= 24:00")
+    for a, b in p.ranges():
+        if not 0 <= a < b <= 1440:
+            raise PlanInputError("allowed hours must satisfy 0 <= start < end <= 24:00")
+        if a % p.step_min:
+            raise PlanInputError(f"times must be on a {p.step_min}-minute grid")
     if not 15 <= p.duration_min <= 480 or p.duration_min % 15:
         raise PlanInputError("duration must be 15-480 minutes in 15-minute steps")
-    if p.duration_min > p.allowed_end_min - p.allowed_start_min:
+    if all(p.duration_min > b - a for a, b in p.ranges()):
         raise PlanInputError("activity is longer than the permitted hours")
     if not 0 <= p.baseline_start_min <= 1440 - 15:
         raise PlanInputError("baseline start must be within the selected day")
@@ -189,7 +198,7 @@ def validate(p: PlanInput) -> ZoneInfo:
         raise PlanInputError("planning threshold must be between 0 and 500")
     if p.step_min <= 0 or 60 % p.step_min:
         raise PlanInputError("step must divide 60")
-    if (p.baseline_start_min - p.allowed_start_min) % p.step_min or p.allowed_start_min % p.step_min:
+    if p.baseline_start_min % p.step_min:
         # Keeps the baseline on the candidate grid, so an eligible baseline is
         # always one of the ranked candidates and comparisons stay consistent.
         raise PlanInputError(f"times must be on a {p.step_min}-minute grid")
@@ -203,19 +212,24 @@ def plan(
 ) -> dict[str, Any]:
     tz = validate(p)
     duration = timedelta(minutes=p.duration_min)
-    allowed_start = local_minutes_to_utc(p.day, p.allowed_start_min, tz)
-    allowed_end = local_minutes_to_utc(p.day, p.allowed_end_min, tz)
+    utc_ranges = [(local_minutes_to_utc(p.day, a, tz), local_minutes_to_utc(p.day, b, tz)) for a, b in p.ranges()]
+    allowed_start = min(a for a, _ in utc_ranges)
+    allowed_end = max(b for _, b in utc_ranges)
 
     windows: list[Window] = []
-    m = p.allowed_start_min
-    while m + p.duration_min <= p.allowed_end_min:
-        start = local_minutes_to_utc(p.day, m, tz)
-        end = start + duration
-        if end <= allowed_end:
-            w = evaluate_window(start, end, series, p.threshold_aqi, p.interval_s)
-            w.starts_in_past = start < now
-            windows.append(w)
-        m += p.step_min
+    seen: set[datetime] = set()
+    for (a_min, b_min), (_, r_end) in zip(p.ranges(), utc_ranges):
+        m = a_min
+        while m + p.duration_min <= b_min:
+            start = local_minutes_to_utc(p.day, m, tz)
+            end = start + duration
+            if end <= r_end and start not in seen:
+                seen.add(start)
+                w = evaluate_window(start, end, series, p.threshold_aqi, p.interval_s)
+                w.starts_in_past = start < now
+                windows.append(w)
+            m += p.step_min
+    windows.sort(key=lambda w: w.start)
 
     future = [w for w in windows if not w.starts_in_past]
     complete = [w for w in future if w.complete]
@@ -225,7 +239,7 @@ def plan(
 
     b_start = local_minutes_to_utc(p.day, p.baseline_start_min, tz)
     baseline = evaluate_window(b_start, b_start + duration, series, p.threshold_aqi, p.interval_s)
-    baseline.in_allowed_hours = allowed_start <= b_start and b_start + duration <= allowed_end
+    baseline.in_allowed_hours = any(a <= b_start and b_start + duration <= b for a, b in utc_ranges)
     baseline.starts_in_past = b_start < now
 
     if best:
@@ -251,6 +265,10 @@ def plan(
             "start_local": allowed_start.astimezone(tz).isoformat(),
             "end_local": allowed_end.astimezone(tz).isoformat(),
         },
+        "allowed_ranges": [
+            {"start_utc": _iso_utc(a), "end_utc": _iso_utc(b), "label": f"{a.astimezone(tz):%H:%M}–{b.astimezone(tz):%H:%M}"}
+            for a, b in utc_ranges
+        ],
         "now_utc": _iso_utc(now),
         "counts": {
             "candidates": len(windows),

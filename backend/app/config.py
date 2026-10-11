@@ -6,6 +6,7 @@ from pathlib import Path
 
 BACKEND_DIR = Path(__file__).resolve().parent.parent
 DEFAULT_REPLAY = BACKEND_DIR / "fixtures" / "replay_delhi.json"
+DEFAULT_DATA_DIR = BACKEND_DIR / ".data"
 
 
 def _load_dotenv() -> None:
@@ -21,6 +22,11 @@ def _load_dotenv() -> None:
             break
 
 
+def _choice(name: str, default: str, allowed: tuple[str, ...]) -> str:
+    v = os.environ.get(name, default).strip().lower()
+    return v if v in allowed else default
+
+
 @dataclass(frozen=True)
 class Settings:
     data_mode: str = "live"  # live | replay
@@ -28,24 +34,58 @@ class Settings:
     replay_file: Path = DEFAULT_REPLAY
     cors_origins: list[str] = field(default_factory=list)
     static_dir: Path | None = None
+    # Campus workflow backends. Defaults are LOCAL and labelled as such.
+    store: str = "local"  # local (SQLite file) | dynamodb
+    table_name: str = ""
+    auth_mode: str = "local"  # local (dev sign-in) | cognito
+    cognito_region: str = ""
+    cognito_user_pool_id: str = ""
+    cognito_client_id: str = ""
+    notifier: str = "local"  # local (outbox, never sends) | sns
+    topic_arn: str = ""
+    evidence: str = "local"  # local files | s3
+    evidence_bucket: str = ""
+    bedrock_model_id: str = ""
+    nvidia_api_key: str = ""
+    nvidia_model: str = "nvidia/nemotron-3-super-120b-a12b"
+    app_url: str = ""
+    data_dir: Path = DEFAULT_DATA_DIR
+    local_auth_secret: str = ""
 
     @property
     def openaq_configured(self) -> bool:
         return bool(self.openaq_api_key)
 
+    @property
+    def on_aws(self) -> bool:
+        return self.store == "dynamodb"
+
 
 def load_settings() -> Settings:
     if not os.environ.get("AWS_LAMBDA_FUNCTION_NAME"):
         _load_dotenv()
-    mode = os.environ.get("DATA_MODE", "live").strip().lower()
-    if mode not in ("live", "replay"):
-        mode = "live"
     origins = [o.strip() for o in os.environ.get("CORS_ORIGINS", "").split(",") if o.strip()]
     static = os.environ.get("STATIC_DIR")
     return Settings(
-        data_mode=mode,
+        data_mode=_choice("DATA_MODE", "live", ("live", "replay")),
         openaq_api_key=os.environ.get("OPENAQ_API_KEY", "").strip(),
         replay_file=Path(os.environ.get("REPLAY_FILE") or DEFAULT_REPLAY),
         cors_origins=origins,
         static_dir=Path(static) if static else None,
+        store=_choice("STORE", "local", ("local", "dynamodb")),
+        table_name=os.environ.get("TABLE_NAME", ""),
+        auth_mode=_choice("AUTH_MODE", "local", ("local", "cognito")),
+        cognito_region=os.environ.get("COGNITO_REGION", os.environ.get("AWS_REGION", "")),
+        cognito_user_pool_id=os.environ.get("COGNITO_USER_POOL_ID", ""),
+        cognito_client_id=os.environ.get("COGNITO_CLIENT_ID", ""),
+        notifier=_choice("NOTIFIER", "local", ("local", "sns")),
+        topic_arn=os.environ.get("TOPIC_ARN", ""),
+        evidence=_choice("EVIDENCE", "local", ("local", "s3")),
+        evidence_bucket=os.environ.get("EVIDENCE_BUCKET", ""),
+        bedrock_model_id=os.environ.get("BEDROCK_MODEL_ID", "").strip(),
+        nvidia_api_key=os.environ.get("NVIDIA_API_KEY", "").strip(),
+        nvidia_model=os.environ.get("NVIDIA_MODEL", "").strip() or "nvidia/nemotron-3-super-120b-a12b",
+        app_url=os.environ.get("APP_URL", ""),
+        data_dir=Path(os.environ.get("DATA_DIR") or DEFAULT_DATA_DIR),
+        local_auth_secret=os.environ.get("LOCAL_AUTH_SECRET", ""),
     )

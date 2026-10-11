@@ -1,3 +1,7 @@
 -r requirements.txt
 uvicorn==0.54.0
 pytest==9.1.1
+# AWS SDK: provided by the Lambda Python runtime; pinned here for local AWS mode and tests.
+boto3==1.43.111
+# Local AWS API emulator used ONLY in tests of the DynamoDB/SNS/S3 adapters.
+moto[dynamodb,sns,s3,scheduler]==5.2.3
