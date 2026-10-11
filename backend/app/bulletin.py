@@ -41,11 +41,9 @@ def facts_from_card(card: dict) -> dict[str, Any]:
         "participants_estimate": card["activity"]["participants"],
         "aqi_standard": "US AQI", "planned_peak_us_aqi": p["peak_aqi"], "planned_category_key": card["planned_category"]["key"],
         "planned_category": card["planned_category"]["label"], "planning_threshold_us_aqi": card["threshold_aqi"],
-        "planned_pm25_index_ug_h_m3": None if p["pm25_index"] is None else round(p["pm25_index"], 1),
         "status": card["status"],
         "alternative": None if not alt else {
             "time_local": alt["label"], "peak_us_aqi": alt["peak_aqi"], "meets_threshold": alt["meets_threshold"],
-            "pm25_index_ug_h_m3": round(alt["pm25_index"], 1),
             "pct_change_vs_planned": (card.get("comparison") or {}).get("pct_change")},
         "data": {"source": "Open-Meteo Air Quality API, CAMS Global model forecast", "resolution": "about 45 km",
                  "retrieved_at": card["provenance"]["retrieved_at"], "data_type": "modelled forecast, not a measurement",
@@ -109,10 +107,21 @@ _NUM = re.compile(r"\d+(?:\.\d+)?")
 _TIME = re.compile(r"\b\d{1,2}:\d{2}\b")
 
 
+_META = re.compile(r"\s*\((?:word count|words|शब्द(?: संख्या)?)\s*[:：]?\s*\d+\)\s*$", re.IGNORECASE)
+_UNITS = re.compile(r"µg|μg|ug/m|mg/m|माइक्रोग्राम", re.IGNORECASE)
+
+
+def strip_meta(text: str) -> str:
+    """Remove a trailing '(Word count: N)' note some models append. Nothing else is altered."""
+    return _META.sub("", text or "").strip()
+
+
 def validate(text: str, f: dict, reference: str) -> str | None:
     """Return a rejection reason, or None if every number/time is grounded in the facts."""
     if not text or len(text) > 1500:
         return "empty or too long"
+    if _UNITS.search(text):
+        return "mentions concentration units that are not part of the facts"
     norm = text.translate(_DEVANAGARI)
     allowed_src = json.dumps(f, ensure_ascii=False) + "\n" + reference
     allowed_nums = {_canon(n) for n in _NUM.findall(allowed_src)} | {"2.5", "10", "45", "0"}
@@ -139,7 +148,8 @@ SYSTEM_PROMPT = (
     "given. Do not add numbers, times, causes, health or medical advice, or recommendations not in the facts. "
     "Do not calculate anything. Keep every number and time exactly as given, using Western digits. "
     "Mention that it is a modelled forecast and that the guidance is US AQI guidance from AirNow, not an "
-    "Indian government directive. Maximum 120 words. Plain text only."
+    "Indian government directive. Maximum 120 words. Plain text only. Do not add a word count, title, notes "
+    "or any commentary about the text itself."
 )
 NVIDIA_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
 DEFAULT_NVIDIA_MODEL = "nvidia/nemotron-3-super-120b-a12b"
@@ -199,7 +209,7 @@ async def bulletin(card: dict, lang: str, model_id: str = "", client: Any | None
         providers.append(("NVIDIA API (fallback)", nvidia_model, lambda: _nvidia(f, lang, nvidia_key, nvidia_model, http)))
     for name, model, call in providers:
         try:
-            text = await call()
+            text = strip_meta(await call())
         except Exception as exc:  # noqa: BLE001 - any failure moves to the next provider
             out["ai_attempts"].append({"provider": name, "model": model, "status": f"failed: {exc.__class__.__name__}"})
             continue

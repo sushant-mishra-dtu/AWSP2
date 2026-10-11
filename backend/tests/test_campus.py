@@ -346,6 +346,9 @@ def test_bulletin_deterministic_and_ai_validation(api, router):
     assert b.validate("Peak US AQI 170 at 07:30–08:30; threshold 150.", f, det) is None
     assert "number 165" in b.validate("Peak US AQI 165 at 07:30.", f, det)
     assert "time 09:15" in b.validate("Move it to 09:15.", f, det)
+    assert "concentration units" in b.validate("PM2.5 index 96.0 µg/m³ at 07:30.", f, det)
+    assert b.strip_meta("Peak US AQI 170." + chr(10) + "(Word count: 118)") == "Peak US AQI 170."
+    assert "planned_pm25_index_ug_h_m3" not in f  # index values are never sent to a model
 
     class FakeHttp:
         def __init__(self, text):

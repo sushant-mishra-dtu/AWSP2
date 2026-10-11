@@ -8,6 +8,9 @@ import MapView, { type Bounds } from "./components/MapView";
 import Planner from "./components/Planner";
 import SearchBox, { DEMO_PLACES } from "./components/SearchBox";
 import StationsPanel from "./components/StationsPanel";
+import CampusWorkspace from "./components/campus/CampusWorkspace";
+import ImpactPanel from "./components/campus/ImpactPanel";
+import { campusApi, type RuntimeInfo } from "./campusApi";
 import { useDebounced, useLocalState, useMediaQuery } from "./hooks";
 import type { GridResponse, Health, PlanPrefs, PlanResponse, PointResponse, SelectedLocation, StationsResponse } from "./types";
 import { addDays, isoToEpoch, localDate, parseHm } from "./time";
@@ -61,6 +64,13 @@ export default function App() {
   const [legendOpen, setLegendOpen] = useState(true);
 
   const [showStations, setShowStations] = useState(false);
+  const [view, setView] = useLocalState<"explore" | "campus" | "impact">("airwindow.view.v1", "explore", (v): v is "explore" | "campus" | "impact" => v === "explore" || v === "campus" || v === "impact");
+  const [runtime, setRuntime] = useState<RuntimeInfo | null>(null);
+  const [markers, setMarkers] = useState<{ lat: number; lon: number; label: string; kind: "campus" | "report" }[]>([]);
+  useEffect(() => {
+    campusApi(() => null).runtime().then(setRuntime).catch(() => setRuntime(null));
+  }, []);
+  const focusMap = useCallback((lat: number, lon: number) => setFlyTo({ lat, lon, zoom: 10, seq: Date.now() }), []);
   const [stations, setStations] = useState<StationsResponse | null>(null);
   const [stationsLoading, setStationsLoading] = useState(false);
   const [stationsError, setStationsError] = useState<string | null>(null);
@@ -240,6 +250,10 @@ export default function App() {
           REPLAY · captured {health?.replay?.captured_at?.replace("T", " ").replace("Z", " UTC")}
           {health?.replay?.synthetic ? " · SYNTHETIC" : ""}
         </span>
+      ) : runtime?.local_mode_notice ? (
+        <span className="flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-full bg-amber-50 px-2.5 py-1 text-[11px] font-semibold text-amber-900 ring-1 ring-amber-300" title={runtime.local_mode_notice}>
+          LIVE DATA · LOCAL MODE
+        </span>
       ) : mode === "live" ? (
         <span className="flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-full bg-emerald-50 px-2.5 py-1 text-[11px] font-semibold text-emerald-800 ring-1 ring-emerald-200">
           <span className="h-1.5 w-1.5 rounded-full bg-emerald-500" /> LIVE DATA
@@ -311,6 +325,7 @@ export default function App() {
         onBounds={onBounds}
         onZoom={setZoom}
         wheelZoom={isDesktop}
+        extraMarkers={view === "campus" ? markers : []}
         onSelect={(lat, lon) => select({ lat, lon, tz: null })}
       />
       <div className="pointer-events-none absolute inset-x-2 top-2 z-[500] flex flex-wrap items-start gap-2 pr-12">
@@ -374,6 +389,25 @@ export default function App() {
     </div>
   );
 
+  const tabs = (
+    <nav className="grid grid-cols-3 gap-1 border-b border-line bg-white px-4 pb-2 text-xs" aria-label="Sections">
+      {([["explore", "Explore map"], ["campus", "My campus"], ["impact", "Impact"]] as const).map(([v, l]) => (
+        <button key={v} aria-pressed={view === v} onClick={() => setView(v)}
+          className={`rounded-md px-2 py-1.5 font-semibold ${view === v ? "bg-ink text-white" : "text-ink-soft hover:bg-slate-100"}`}>
+          {l}
+        </button>
+      ))}
+    </nav>
+  );
+  const content =
+    view === "campus" ? (
+      <CampusWorkspace runtime={runtime} selected={selected} selectedTz={point?.location.timezone ?? selected.tz ?? null} onMarkers={setMarkers} onFocus={focusMap} />
+    ) : view === "impact" ? (
+      <ImpactPanel />
+    ) : (
+      panels
+    );
+
   const search = (
     <div className="border-b border-line bg-white px-4 py-3">
       <SearchBox
@@ -390,7 +424,8 @@ export default function App() {
         <aside className="flex w-[440px] shrink-0 flex-col border-r border-line bg-canvas">
           {header}
           {search}
-          <div className="flex-1 overflow-y-auto">{panels}</div>
+          {tabs}
+          <div className="flex-1 overflow-y-auto">{content}</div>
         </aside>
         <main className="relative flex-1">{map}</main>
       </div>
@@ -400,8 +435,9 @@ export default function App() {
     <div className="min-h-dvh bg-canvas">
       {header}
       {search}
+      {tabs}
       <main className="relative h-[58vh] min-h-[360px]">{map}</main>
-      {panels}
+      {content}
     </div>
   );
 }

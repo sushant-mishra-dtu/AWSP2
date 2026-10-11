@@ -12,7 +12,7 @@ export class ApiError extends Error {
   }
 }
 
-async function request<T>(path: string, init?: RequestInit & { timeoutMs?: number }): Promise<T> {
+export async function request<T>(path: string, init?: RequestInit & { timeoutMs?: number }): Promise<T> {
   const ctl = new AbortController();
   const timeout = setTimeout(() => ctl.abort(new DOMException("timeout", "TimeoutError")), init?.timeoutMs ?? 25000);
   const outer = init?.signal;
@@ -30,6 +30,7 @@ async function request<T>(path: string, init?: RequestInit & { timeoutMs?: numbe
       const err = (body as { error?: { message?: string; kind?: string }; detail?: unknown } | null) ?? null;
       const msg =
         err?.error?.message ??
+        (typeof err?.detail === "string" ? err.detail : undefined) ??
         (Array.isArray(err?.detail) ? "Invalid request" : undefined) ??
         `Request failed (${res.status})`;
       throw new ApiError(msg, res.status, err?.error?.kind);

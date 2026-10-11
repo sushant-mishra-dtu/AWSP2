@@ -4,7 +4,13 @@
     {
       "name": "api",
       "runtimeExecutable": ".venv/Scripts/python.exe",
-      "runtimeArgs": ["-m", "uvicorn", "app.main:app", "--app-dir", "backend", "--host", "127.0.0.1", "--port", "8000"],
+      "runtimeArgs": ["backend/scripts/serve.py", "--port", "8000"],
+      "port": 8000
+    },
+    {
+      "name": "api-demo-synthetic",
+      "runtimeExecutable": ".venv/Scripts/python.exe",
+      "runtimeArgs": ["backend/scripts/serve.py", "--demo", "synthetic", "--port", "8000"],
       "port": 8000
     },
     {

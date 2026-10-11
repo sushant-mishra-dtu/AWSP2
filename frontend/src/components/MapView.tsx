@@ -28,7 +28,21 @@ interface Props {
   onSelect: (lat: number, lon: number) => void;
   onZoom: (z: number) => void;
   wheelZoom: boolean;
+  extraMarkers?: { lat: number; lon: number; label: string; kind: "campus" | "report" }[];
 }
+
+const campusIcon = L.divIcon({
+  className: "pin-icon",
+  iconSize: [26, 26],
+  iconAnchor: [13, 13],
+  html: `<svg width="26" height="26" viewBox="0 0 26 26" aria-hidden="true"><rect x="2" y="2" width="22" height="22" rx="6" fill="#0e7490" stroke="#fff" stroke-width="2"/><path d="M7 18V11l6-4 6 4v7h-4v-4h-4v4z" fill="#fff"/></svg>`,
+});
+const reportIcon = L.divIcon({
+  className: "pin-icon",
+  iconSize: [22, 22],
+  iconAnchor: [11, 11],
+  html: `<svg width="22" height="22" viewBox="0 0 22 22" aria-hidden="true"><path d="M11 2 21 19H1z" fill="#ffffff" stroke="#0f172a" stroke-width="2"/><text x="11" y="17" font-size="10" text-anchor="middle" font-family="sans-serif" font-weight="700" fill="#0f172a">!</text></svg>`,
+});
 
 const pinIcon = L.divIcon({
   className: "pin-icon",
@@ -236,6 +250,11 @@ export default function MapView(p: Props) {
           );
         })}
 
+      {(p.extraMarkers ?? []).map((mk, i) => (
+        <Marker key={`x-${i}-${mk.lat}-${mk.lon}`} position={[mk.lat, mk.lon]} icon={mk.kind === "campus" ? campusIcon : reportIcon} keyboard={false}>
+          <Tooltip className="cell-tip">{mk.kind === "campus" ? `Campus: ${mk.label}` : mk.label}</Tooltip>
+        </Marker>
+      ))}
       {p.selected && <Marker position={[p.selected.lat, p.selected.lon]} icon={pinIcon} keyboard={false} />}
     </MapContainer>
   );

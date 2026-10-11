@@ -30,3 +30,4 @@ Thumbs.db
 
 # Local-mode data (SQLite store, dev sign-in secret, evidence files)
 backend/.data/
+backend/.data-demo-*/
